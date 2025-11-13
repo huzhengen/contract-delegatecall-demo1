@@ -6,9 +6,21 @@ import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 
+// Chainlink 价格预言机接口
+interface AggregatorV3Interface {
+    function latestRoundData() external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+    function decimals() external view returns (uint8);
+}
+
 /**
  * @title NFTCollection
- * @dev 简单的 ERC721 NFT 集合合约
+ * @dev 简单的 ERC721 NFT 集合合约，支持通过预言机以 USDT 计价
  */
 contract NFTCollection is ERC721, ERC721URIStorage, Ownable {
     uint256 private _tokenIds; // 代币 ID 计数器
@@ -19,9 +31,11 @@ contract NFTCollection is ERC721, ERC721URIStorage, Ownable {
 
     uint256 public maxSupply = 10000; // NFT 最大供应量
 
-    uint256 public mintPrice = 0; // 铸造价格（0 表示免费铸造）
+    uint256 public mintPriceUSD = 1e18; // 铸造价格（1 USDT，18 位小数）
 
     uint256 public maxMintPerTx = 10; // 每笔交易最多可铸造的 NFT 数量
+
+    AggregatorV3Interface public priceFeed; // BNB/USD 价格预言机
 
     mapping(address => bool) public whitelisted; // 预售白名单
     bool public whitelistEnabled = false; // 是否启用白名单
@@ -52,14 +66,17 @@ contract NFTCollection is ERC721, ERC721URIStorage, Ownable {
      * @param name_ NFT 集合的名称
      * @param symbol_ NFT 集合的符号
      * @param baseTokenURI_ 所有代币的基础 URI
+     * @param priceFeedAddress_ BNB/USD 价格预言机地址
      */
     constructor(
         string memory name_,
         string memory symbol_,
-        string memory baseTokenURI_
+        string memory baseTokenURI_,
+        address priceFeedAddress_
     ) ERC721(name_, symbol_) Ownable(msg.sender) { // 初始化 ERC721 和 Ownable
         _baseTokenURI = baseTokenURI_; // 设置基础 URI
         royaltyRecipient = payable(msg.sender); // 设置版税接收者为部署者
+        priceFeed = AggregatorV3Interface(priceFeedAddress_); // 设置价格预言机
     }
 
     /**
@@ -123,16 +140,48 @@ contract NFTCollection is ERC721, ERC721URIStorage, Ownable {
     }
 
     /**
-     * @dev 根据销售状态获取当前铸造价格
-     * @return 当前铸造价格
+     * @dev 根据销售状态获取当前铸造价格（以 BNB 计价）
+     * @return 当前铸造价格（BNB 数量）
      */
     function getMintPrice() public view returns (uint256) {
+        uint256 usdPrice; // USDT 价格
+
         if (presaleActive && whitelistEnabled && whitelisted[msg.sender]) { // 如果是预售且启用白名单且调用者在白名单中
-            return presalePrice; // 返回预售价格
+            usdPrice = presalePrice; // 使用预售价格
         } else if (saleActive) { // 如果是公开销售
-            return publicSalePrice; // 返回公开销售价格
+            usdPrice = publicSalePrice; // 使用公开销售价格
+        } else {
+            usdPrice = mintPriceUSD; // 使用默认铸造价格（1 USDT）
         }
-        return mintPrice; // 返回默认铸造价格
+
+        return _convertUSDToBNB(usdPrice); // 将 USDT 价格转换为 BNB
+    }
+
+    /**
+     * @dev 通过预言机将 USDT 价格转换为 BNB 数量
+     * @param usdAmount USDT 金额（18 位小数）
+     * @return BNB 数量（18 位小数）
+     */
+    function _convertUSDToBNB(uint256 usdAmount) internal view returns (uint256) {
+        (, int256 price, , , ) = priceFeed.latestRoundData(); // 获取 BNB/USD 最新价格
+        require(price > 0, "Invalid price from oracle"); // 确保价格有效
+
+        uint8 decimals = priceFeed.decimals(); // 获取价格精度（通常是 8）
+
+        // 计算公式: BNB数量 = USDT金额 / (BNB价格 / 10^decimals)
+        // 简化为: BNB数量 = (USDT金额 * 10^decimals) / BNB价格
+        uint256 bnbAmount = (usdAmount * (10 ** decimals)) / uint256(price);
+
+        return bnbAmount; // 返回需要支付的 BNB 数量
+    }
+
+    /**
+     * @dev 设置价格预言机地址（仅所有者）
+     * @param priceFeedAddress_ 新的价格预言机地址
+     */
+    function setPriceFeed(address priceFeedAddress_) external onlyOwner {
+        require(priceFeedAddress_ != address(0), "Invalid price feed address"); // 确保地址有效
+        priceFeed = AggregatorV3Interface(priceFeedAddress_); // 更新价格预言机
     }
 
     /**
@@ -187,15 +236,15 @@ contract NFTCollection is ERC721, ERC721URIStorage, Ownable {
     }
 
     /**
-     * @dev 设置铸造价格（仅所有者）
-     * @param _presalePrice 新的预售价格
-     * @param _publicSalePrice 新的公开销售价格
+     * @dev 设置铸造价格（仅所有者，以 USDT 计价）
+     * @param _presalePrice 新的预售价格（USDT）
+     * @param _publicSalePrice 新的公开销售价格（USDT）
      */
     function setMintPrices(uint256 _presalePrice, uint256 _publicSalePrice) public onlyOwner {
         uint256 previousPresalePrice = presalePrice; // 保存旧的预售价格
         uint256 previousPublicPrice = publicSalePrice; // 保存旧的公开销售价格
-        presalePrice = _presalePrice; // 设置新的预售价格
-        publicSalePrice = _publicSalePrice; // 设置新的公开销售价格
+        presalePrice = _presalePrice; // 设置新的预售价格（USDT）
+        publicSalePrice = _publicSalePrice; // 设置新的公开销售价格（USDT）
         emit MintPriceUpdated(previousPresalePrice, _presalePrice); // 触发预售价格更新事件
         emit MintPriceUpdated(previousPublicPrice, _publicSalePrice); // 触发公开销售价格更新事件
     }
